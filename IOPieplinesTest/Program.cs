@@ -14,18 +14,27 @@ namespace IOPieplinesTest
     {
         static async Task Main(string[] args)
         {
+            ThreadPool.GetMinThreads(out int workerThreads, out int completionPortThreads);
+            ThreadPool.SetMinThreads(100, 100);
             Console.WriteLine("Hello World!");
             var listenSocket = new Socket(SocketType.Stream, ProtocolType.Tcp);
             listenSocket.Bind(new IPEndPoint(IPAddress.Loopback, 1081));
             listenSocket.Listen(120);
-
+            Console.WriteLine();
             while (true)
             {
                 var socket = await listenSocket.AcceptAsync();
 
                 ThreadPool.QueueUserWorkItem(async q =>
                 {
-                    await ProcessHandshakeAsync(socket);
+                    try
+                    {
+                        await ProcessHandshakeAsync(socket);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(ex.Message);
+                    }
                 });
             }
 
@@ -78,7 +87,16 @@ namespace IOPieplinesTest
                     Array.Reverse(bs, bytesRead - 2, 2);
                     var port = BitConverter.ToInt16(bs, bytesRead - 2);
                     Socket remote = new Socket(SocketType.Stream, ProtocolType.Tcp);
-                    remote.Connect(ipadderss, port);
+
+                    var timeoutTask = Task.Delay(TimeSpan.FromSeconds(2));
+                    var rec = remote.ConnectAsync(ipadderss, port);
+
+                    var completedTask = await Task.WhenAny(timeoutTask, rec);
+                    if (completedTask == timeoutTask)
+                    {
+                        socket.Send(new byte[] { 5, 4 });
+                        return;
+                    }
 
                     List<byte> res = new List<byte>();
                     res.Add(0x05);
@@ -90,7 +108,11 @@ namespace IOPieplinesTest
                     res.AddRange(BitConverter.GetBytes((ushort)IPAddress.HostToNetworkOrder(localEP.Port)));
                     socket.Send(res.ToArray());
 
-                    Task.WaitAll(ReadLocalToServer(socket, remote), ReadServerToLocal(remote, socket));
+                    try
+                    {
+                        Task.WaitAny(ReplayToServer(socket, remote), ReplayToLcoal(remote, socket));
+                    }
+                    catch { }
 
 
                     break;
@@ -99,45 +121,104 @@ namespace IOPieplinesTest
                     break;
             }
         }
-        private static async Task ReadLocalToServer(Socket local, Socket server)
+
+        static void Close(Socket socket)
         {
-            var pipe = new Pipe();
-            const int minimumBufferSize = 10240;
-
-            Memory<byte> memory = pipe.Writer.GetMemory(minimumBufferSize);
-            int bytesRead = await local.ReceiveAsync(memory, SocketFlags.None);
-            if (bytesRead <= 0) return;
-            pipe.Writer.Advance(bytesRead);
-            FlushResult r = await pipe.Writer.FlushAsync();
-
-            ReadResult result = await pipe.Reader.ReadAsync();
-            ReadOnlySequence<byte> buffer = result.Buffer;
-            var line = buffer.Slice(0, buffer.Length);
-            var bs = line.ToArray();
-            server.Send(bs);
-
-            await ReadLocalToServer(local, server);
+            socket.Shutdown(SocketShutdown.Both);
+            socket.Close();
+            socket.Dispose();
         }
 
-        private static async Task ReadServerToLocal(Socket local, Socket server)
+        private static async Task ReplayToServer(Socket local, Socket server)
         {
-            var pipe = new Pipe();
-            const int minimumBufferSize = 10240;
+            const int minimumBufferSize = 2048;
 
-            Memory<byte> memory = pipe.Writer.GetMemory(minimumBufferSize);
-            int bytesRead = await local.ReceiveAsync(memory, SocketFlags.None);
-            if (bytesRead <= 0) return;
-            pipe.Writer.Advance(bytesRead);
-            FlushResult r = await pipe.Writer.FlushAsync();
+            while (true)
+            {
+                var pipe = new Pipe();
+                try
+                {
+                    Memory<byte> memory = pipe.Writer.GetMemory(minimumBufferSize);
+                    var timeoutTask = Task.Delay(TimeSpan.FromSeconds(2));
+                    var rec = local.ReceiveAsync(memory, SocketFlags.None).AsTask();
 
-            ReadResult result = await pipe.Reader.ReadAsync();
-            ReadOnlySequence<byte> buffer = result.Buffer;
-            var line = buffer.Slice(0, buffer.Length);
-            var bs = line.ToArray();
-            server.Send(bs);
+                    var completedTask = await Task.WhenAny(timeoutTask, rec);
+                    if (completedTask == timeoutTask)
+                    {
+                        Close(local);
+                        Console.WriteLine("                     local   Close");
+                        return;
+                    }
+                    int bytesRead = rec.Result;
+                    if (bytesRead <= 0)
+                    {
+                        Close(local);
+                        Console.WriteLine("                     local   Close");
+                        return;
+                    }
+                    pipe.Writer.Advance(bytesRead);
+                    FlushResult r = await pipe.Writer.FlushAsync();
 
-            await ReadLocalToServer(local, server);
+                    ReadResult result = await pipe.Reader.ReadAsync();
+                    ReadOnlySequence<byte> buffer = result.Buffer;
+                    var line = buffer.Slice(0, buffer.Length);
+                    var bs = line.ToArray();
 
+                    await server.SendAsync(buffer.First, SocketFlags.None);
+                }
+                catch (Exception ex)
+                {
+                    Close(server);
+                    Console.WriteLine("                     server  Close");
+                    return;
+                }
+            }
         }
+
+        private static async Task ReplayToLcoal(Socket server, Socket local)
+        {
+            const int minimumBufferSize = 2048;
+            while (true)
+            {
+                var pipe = new Pipe();
+                try
+                {
+                    Memory<byte> memory = pipe.Writer.GetMemory(minimumBufferSize);
+                    var timeoutTask = Task.Delay(TimeSpan.FromSeconds(2));
+                    var rec = server.ReceiveAsync(memory, SocketFlags.None).AsTask();
+
+                    var completedTask = await Task.WhenAny(timeoutTask, rec);
+                    if (completedTask == timeoutTask)
+                    {
+                        Close(server);
+                        Console.WriteLine("                     server   Close");
+                        return;
+                    }
+                    int bytesRead = rec.Result;
+
+                    if (bytesRead <= 0)
+                    {
+                        Close(server);
+                        Console.WriteLine("                     server  Close");
+                        return;
+                    }
+                    pipe.Writer.Advance(bytesRead);
+                    FlushResult r = await pipe.Writer.FlushAsync();
+
+                    ReadResult result = await pipe.Reader.ReadAsync();
+                    ReadOnlySequence<byte> buffer = result.Buffer;
+
+                    await local.SendAsync(buffer.First, SocketFlags.None);
+                }
+                catch (Exception ex)
+                {
+                    Close(local);
+                    Console.WriteLine("                     local   Close");
+                    return;
+                }
+
+            }
+        }
+
     }
 }
